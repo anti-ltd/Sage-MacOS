@@ -1,7 +1,8 @@
 import SwiftUI
 import iUX_MacOS
+import AppKit
 
-// MARK: - Chat scroll + input
+// MARK: - Main chat view
 
 public struct ChatView: View {
     @Bindable var model: SageModel
@@ -14,6 +15,8 @@ public struct ChatView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
+            modelBar
+            Divider()
             if !model.isAvailable {
                 unavailableView
             } else {
@@ -21,6 +24,70 @@ public struct ChatView: View {
                 Divider()
                 inputBar
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Model picker bar
+
+    private var modelBar: some View {
+        HStack(spacing: 8) {
+            Picker("", selection: $model.selectedBackend) {
+                ForEach(BackendType.allCases) { t in
+                    Label(t.shortLabel, systemImage: t.icon).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 220)
+            .labelsHidden()
+
+            if model.selectedBackend == .llamaCpp {
+                llamaStatusPill
+            }
+
+            Spacer()
+
+            Button {
+                model.newConversation()
+            } label: {
+                Image(systemName: "square.and.pencil")
+                    .imageScale(.medium)
+            }
+            .buttonStyle(.plain)
+            .help("New conversation")
+            .opacity(model.messages.isEmpty ? 0.35 : 1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private var llamaStatusPill: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(statusColor(model.llama.serverStatus))
+                .frame(width: 6, height: 6)
+            Text(llamaStatusLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var llamaStatusLabel: String {
+        switch model.llama.serverStatus {
+        case .idle:          return model.llama.modelName ?? "No model"
+        case .starting:      return "Loading…"
+        case .ready:         return model.llama.modelName ?? "Ready"
+        case .error:         return "Error"
+        }
+    }
+
+    private func statusColor(_ status: LlamaCppBackend.ServerStatus) -> Color {
+        switch status {
+        case .idle:     return .secondary
+        case .starting: return .yellow
+        case .ready:    return .green
+        case .error:    return .red
         }
     }
 
@@ -31,34 +98,33 @@ public struct ChatView: View {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 32))
                 .foregroundStyle(.secondary)
-            Text(model.unavailabilityReason ?? "On-device AI unavailable.")
+            Text(model.unavailabilityReason ?? "AI unavailable.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .font(.callout)
+                .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
     }
 
-    // MARK: - Messages
+    // MARK: - Messages (only this scrolls)
 
     private var messagesView: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    if model.messages.isEmpty {
-                        emptyState
-                    }
+                    if model.messages.isEmpty { emptyState }
                     ForEach(model.messages) { msg in
-                        MessageBubble(message: msg)
+                        MessageBubble(message: msg, backend: model.selectedBackend)
                             .id(msg.id)
                     }
                 }
                 .padding(12)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onChange(of: model.messages.count) {
                 if let last = model.messages.last {
-                    withAnimation(.easeOut(duration: 0.2)) {
+                    withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
@@ -84,18 +150,17 @@ public struct ChatView: View {
         .padding(.vertical, 40)
     }
 
-    // MARK: - Input bar
+    // MARK: - Input bar (fixed at bottom)
 
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("Message", text: $model.inputText, axis: .vertical)
                 .textFieldStyle(.plain)
-                .lineLimit(compact ? 3 : 6)
+                .lineLimit(compact ? 4 : 8)
                 .font(.body)
                 .onSubmit { sendIfReady() }
                 .submitLabel(.send)
                 .onKeyPress(.return) {
-                    // Shift+Return inserts newline; plain Return sends
                     sendIfReady()
                     return .handled
                 }
@@ -104,10 +169,18 @@ public struct ChatView: View {
             Button(action: sendIfReady) {
                 Image(systemName: model.isStreaming ? "stop.circle.fill" : "arrow.up.circle.fill")
                     .font(.system(size: 22))
-                    .foregroundStyle(model.inputText.isEmpty && !model.isStreaming ? Color.secondary : Color.accentColor)
+                    .foregroundStyle(
+                        model.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            && !model.isStreaming
+                            ? Color.secondary
+                            : Color.accentColor
+                    )
             }
             .buttonStyle(.plain)
-            .disabled(model.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !model.isStreaming)
+            .disabled(
+                model.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !model.isStreaming
+            )
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -122,13 +195,14 @@ public struct ChatView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    let backend: BackendType
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
             if message.role == .user { Spacer(minLength: 40) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 2) {
-                Text(message.content.isEmpty && message.isStreaming ? "…" : message.content)
+                Text(message.content.isEmpty && message.isStreaming ? " " : message.content)
                     .textSelection(.enabled)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
@@ -138,12 +212,16 @@ struct MessageBubble: View {
                                   ? Color.accentColor
                                   : Color(nsColor: .controlBackgroundColor))
                     )
-                    .foregroundStyle(message.role == .user ? .white : .primary)
+                    .foregroundStyle(message.role == .user ? Color.white : Color.primary)
 
                 if message.isStreaming {
-                    Text("Thinking…")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    HStack(spacing: 4) {
+                        Image(systemName: backend.icon)
+                            .imageScale(.small)
+                        Text("Thinking…")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
                 }
             }
 
@@ -152,7 +230,7 @@ struct MessageBubble: View {
     }
 }
 
-// MARK: - Settings tab in window
+// MARK: - Settings tab
 
 struct SageSettingsContent: View {
     @Bindable var model: SageModel
@@ -181,6 +259,10 @@ struct SageSettingsContent: View {
                     }
                 }
 
+                iUX_MacOS.CardSection("llama.cpp") {
+                    LlamaCppSettingsContent(backend: model.llama)
+                }
+
                 iUX_MacOS.CardSection("Conversation") {
                     Button("New Conversation", role: .destructive) {
                         model.newConversation()
@@ -190,6 +272,86 @@ struct SageSettingsContent: View {
             .padding()
         }
         .onAppear { draft = model.systemPrompt }
+    }
+}
+
+// MARK: - llama.cpp settings panel
+
+struct LlamaCppSettingsContent: View {
+    @Bindable var backend: LlamaCppBackend
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Model file row
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(backend.modelName ?? "No model selected")
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("GGUF format · downloaded from HuggingFace or llm.gguf.ai")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button("Choose…") {
+                    Task { try? await backend.loadModelFromPanel() }
+                }
+                .controlSize(.small)
+            }
+
+            // Status row
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Text(statusText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if case .ready = backend.serverStatus {
+                    Button("Restart") {
+                        Task { try? await backend.startServer() }
+                    }
+                    .controlSize(.small)
+                } else if case .idle = backend.serverStatus, backend.modelURL != nil {
+                    Button("Load") {
+                        Task { try? await backend.startServer() }
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            if case .error(let msg) = backend.serverStatus {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("Requires `brew install llama.cpp` — runs fully offline on your Mac.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var dotColor: Color {
+        switch backend.serverStatus {
+        case .idle:     return .secondary
+        case .starting: return .yellow
+        case .ready:    return .green
+        case .error:    return .red
+        }
+    }
+
+    private var statusText: String {
+        switch backend.serverStatus {
+        case .idle:      return "Not loaded"
+        case .starting:  return backend.loadingProgress.isEmpty ? "Starting…" : backend.loadingProgress
+        case .ready:     return "Ready"
+        case .error:     return "Error — see below"
+        }
     }
 }
 
@@ -242,4 +404,3 @@ struct SageAboutContent: View {
     }
 #endif
 }
-

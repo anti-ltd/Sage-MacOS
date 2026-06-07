@@ -9,23 +9,41 @@ public final class SageModel {
     public var isStreaming: Bool = false
     public var errorMessage: String?
 
+    public var selectedBackend: BackendType = .apple {
+        didSet {
+            guard selectedBackend != oldValue else { return }
+            messages.removeAll()
+            errorMessage = nil
+            currentBackend.reset(systemPrompt: systemPrompt)
+        }
+    }
+
     public var systemPrompt: String {
         didSet { UserDefaults.standard.set(systemPrompt, forKey: "sage.systemPrompt") }
     }
 
-    private let engine = ChatEngine()
+    public let apple = AppleBackend()
+    public let llama = LlamaCppBackend()
 
-    public var isAvailable: Bool { engine.isAvailable }
-    public var unavailabilityReason: String? { engine.unavailabilityReason }
+    public var currentBackend: any ModelBackend {
+        switch selectedBackend {
+        case .apple:    return apple
+        case .llamaCpp: return llama
+        }
+    }
+
+    public var isAvailable: Bool { currentBackend.isAvailable }
+    public var unavailabilityReason: String? { currentBackend.unavailabilityReason }
     public var isMuted: Bool { false }
 
     public init() {
         systemPrompt = UserDefaults.standard.string(forKey: "sage.systemPrompt")
-            ?? "You are Sage, a helpful assistant running entirely on this device. All processing is private and offline."
+            ?? "You are Sage, a helpful assistant. Be concise and accurate."
     }
 
     public func start() {
-        engine.reset(systemPrompt: systemPrompt)
+        apple.reset(systemPrompt: systemPrompt)
+        llama.reset(systemPrompt: systemPrompt)
     }
 
     public func send() async {
@@ -42,7 +60,7 @@ public final class SageModel {
         isStreaming = true
 
         do {
-            for try await chunk in engine.stream(text) {
+            for try await chunk in currentBackend.stream(text) {
                 if let idx = messages.firstIndex(where: { $0.id == msgID }) {
                     messages[idx].content = chunk
                 }
@@ -63,10 +81,11 @@ public final class SageModel {
     public func newConversation() {
         messages.removeAll()
         errorMessage = nil
-        engine.reset(systemPrompt: systemPrompt)
+        currentBackend.reset(systemPrompt: systemPrompt)
     }
 
     public func applySystemPrompt() {
-        engine.reset(systemPrompt: systemPrompt)
+        apple.reset(systemPrompt: systemPrompt)
+        llama.reset(systemPrompt: systemPrompt)
     }
 }

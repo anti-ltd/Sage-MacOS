@@ -2,7 +2,8 @@ import Foundation
 import FoundationModels
 
 @MainActor
-public final class ChatEngine {
+public final class AppleBackend: ModelBackend {
+    public let type: BackendType = .apple
     private var session: LanguageModelSession?
 
     public var isAvailable: Bool {
@@ -13,10 +14,10 @@ public final class ChatEngine {
     public var unavailabilityReason: String? {
         guard case .unavailable(let reason) = SystemLanguageModel.default.availability else { return nil }
         switch reason {
-        case .deviceNotEligible:          return "This device isn't eligible for on-device AI."
-        case .modelNotReady:              return "The on-device model isn't ready yet. Try again shortly."
-        case .appleIntelligenceNotEnabled: return "Enable Apple Intelligence in System Settings to use Sage."
-        @unknown default:                 return "On-device AI is unavailable."
+        case .deviceNotEligible:           return "This device isn't eligible for on-device AI."
+        case .modelNotReady:               return "On-device model isn't ready yet. Try again shortly."
+        case .appleIntelligenceNotEnabled: return "Enable Apple Intelligence in System Settings."
+        @unknown default:                  return "On-device AI is unavailable."
         }
     }
 
@@ -27,15 +28,13 @@ public final class ChatEngine {
             : LanguageModelSession(instructions: prompt)
     }
 
-    /// Returns a stream of accumulated response text chunks.
-    public func stream(_ text: String) -> AsyncThrowingStream<String, Error> {
+    public func stream(_ userText: String) -> AsyncThrowingStream<String, Error> {
         if session == nil { reset(systemPrompt: "") }
         let current = session!
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    let responseStream = current.streamResponse(to: text)
-                    for try await partial in responseStream {
+                    for try await partial in current.streamResponse(to: userText) {
                         continuation.yield(partial.content)
                     }
                     continuation.finish()
