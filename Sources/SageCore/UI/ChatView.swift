@@ -63,6 +63,12 @@ public struct ChatView: View {
                 }
             }
         }
+        .sheet(item: Binding(
+            get: { model.approvalBroker.pending },
+            set: { if $0 == nil { model.approvalBroker.resolvePending(false) } }
+        )) { approval in
+            ApprovalSheet(approval: approval)
+        }
     }
 
     private var llamaStatusPill: some View {
@@ -247,6 +253,7 @@ public struct ChatView: View {
     }
 
     private func sendIfReady() {
+        if model.isStreaming { model.stop(); return }
         Task { await model.send() }
     }
 }
@@ -258,6 +265,14 @@ struct MessageBubble: View {
     let backend: BackendType
 
     var body: some View {
+        if let activity = message.toolActivity {
+            ToolActivityRow(activity: activity)
+        } else {
+            bubble
+        }
+    }
+
+    private var bubble: some View {
         HStack(alignment: .top, spacing: 0) {
             if message.role == .user { Spacer(minLength: 40) }
 
@@ -287,6 +302,105 @@ struct MessageBubble: View {
 
             if message.role == .assistant { Spacer(minLength: 40) }
         }
+    }
+}
+
+// MARK: - Tool activity row
+
+struct ToolActivityRow: View {
+    let activity: ToolActivity
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .imageScale(.small)
+                .foregroundStyle(tint)
+                .frame(width: 14)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(activity.name)
+                    .font(.caption.weight(.medium))
+                Text(activity.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                if let preview = activity.resultPreview, !preview.isEmpty {
+                    Text(preview)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+        )
+        .padding(.leading, 4)
+    }
+
+    private var icon: String {
+        switch activity.status {
+        case .running: return "gearshape.2"
+        case .ok:      return "checkmark.circle.fill"
+        case .failed:  return "xmark.circle.fill"
+        case .denied:  return "hand.raised.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch activity.status {
+        case .running: return .secondary
+        case .ok:      return .green
+        case .failed:  return .red
+        case .denied:  return .orange
+        }
+    }
+}
+
+// MARK: - Approval sheet
+
+struct ApprovalSheet: View {
+    let approval: PendingApproval
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.shield")
+                    .foregroundStyle(.orange)
+                Text("Approve \(approval.toolName)?")
+                    .font(.headline)
+            }
+
+            ScrollView {
+                Text(approval.preview)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+            }
+            .frame(maxHeight: 180)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(nsColor: .textBackgroundColor))
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+            )
+
+            HStack {
+                Spacer()
+                Button("Deny", role: .cancel) { approval.respond(false) }
+                    .keyboardShortcut(.cancelAction)
+                Button("Approve") { approval.respond(true) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
     }
 }
 
@@ -360,6 +474,11 @@ struct LlamaCppSettingsContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if !backend.isLlamaServerInstalled {
+                installBanner
+                Divider()
+            }
+
             // Model file row
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
@@ -411,6 +530,51 @@ struct LlamaCppSettingsContent: View {
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var installBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("llama.cpp isn't installed.")
+                .font(.callout.weight(.medium))
+
+            if backend.isHomebrewInstalled {
+                Button {
+                    Task { await backend.installLlamaCpp() }
+                } label: {
+                    if backend.installState == .installing {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Installing…")
+                        }
+                    } else {
+                        Label("Install via Homebrew", systemImage: "arrow.down.circle")
+                    }
+                }
+                .controlSize(.small)
+                .disabled(backend.installState == .installing)
+
+                if backend.installState == .installing, !backend.installProgress.isEmpty {
+                    Text(backend.installProgress)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } else {
+                Text("Requires Homebrew. Install it from brew.sh, then return here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if case .failed(let msg) = backend.installState {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 

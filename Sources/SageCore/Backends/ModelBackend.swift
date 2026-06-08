@@ -21,11 +21,20 @@ public enum BackendType: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// What a single backend turn emits as it streams.
+public enum AgentEvent: Sendable {
+    case textDelta(String)
+    case toolCalls([ToolCall])   // the turn finished by requesting these tool calls
+}
+
+/// A model turn-executor. Backends are now *stateless* about conversation history —
+/// the agent loop owns the transcript and passes the full message list each turn.
 @MainActor
 public protocol ModelBackend: AnyObject {
     var type: BackendType { get }
     var isAvailable: Bool { get }
     var unavailabilityReason: String? { get }
-    func reset(systemPrompt: String)
-    func stream(_ userText: String) -> AsyncThrowingStream<String, Error>
+    /// Whether this backend can take a `tools` list and emit `.toolCalls`.
+    var supportsTools: Bool { get }
+    func stream(messages: [LLMMessage], tools: [ToolSpec]) -> AsyncThrowingStream<AgentEvent, Error>
 }

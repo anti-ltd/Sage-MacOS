@@ -1,14 +1,16 @@
 import Foundation
 import AppKit
 
-// Drives a local llama-server subprocess (from `brew install llama.cpp`) and
-// speaks OpenAI-compatible streaming chat completions over localhost HTTP.
-// No C/Swift interop — Metal/GPU is handled by the llama.cpp binary itself.
+// Drives a local llama-server subprocess (from `brew install llama.cpp`) and speaks
+// OpenAI-compatible streaming chat completions over localhost HTTP via the shared
+// OpenAICompatibleClient. The agent loop owns conversation history; this class owns
+// only the server lifecycle and the transport config.
 
 @MainActor
 @Observable
 public final class LlamaCppBackend: ModelBackend {
     public let type: BackendType = .llamaCpp
+    public var supportsTools: Bool { true }
 
     public var modelURL: URL? {
         didSet {
@@ -20,11 +22,13 @@ public final class LlamaCppBackend: ModelBackend {
     public var serverStatus: ServerStatus = .idle
     public var loadingProgress: String = ""
 
+    // Homebrew install of llama.cpp, driven from Settings when the binary is missing.
+    public enum InstallState: Equatable { case idle, installing, failed(String) }
+    public var installState: InstallState = .idle
+    public var installProgress: String = ""
+
     private var serverProcess: Process?
     private let port = 28_450
-    private var systemPromptStore = ""
-    // Conversation history — rebuilt into each request body (OpenAI API is stateless).
-    private var history: [(role: String, content: String)] = []
 
     public enum ServerStatus: Equatable {
         case idle         // no model loaded yet
@@ -71,49 +75,20 @@ public final class LlamaCppBackend: ModelBackend {
 
     // MARK: - ModelBackend
 
-    public func reset(systemPrompt: String) {
-        systemPromptStore = systemPrompt
-        history.removeAll()
-    }
-
-    public func stream(_ userText: String) -> AsyncThrowingStream<String, Error> {
-        history.append((role: "user", content: userText))
-        let messages = buildMessages()
-        let port = self.port
-
-        return AsyncThrowingStream { [weak self] continuation in
-            Task { @MainActor [weak self] in
-                guard let self else { continuation.finish(); return }
+    public func stream(messages: [LLMMessage], tools: [ToolSpec]) -> AsyncThrowingStream<AgentEvent, Error> {
+        let client = OpenAICompatibleClient(config: .init(
+            baseURL: URL(string: "http://localhost:\(port)/v1")!,
+            model: "local"
+        ))
+        return AsyncThrowingStream { continuation in
+            Task {
                 do {
-                    var accumulated = ""
-                    let url = URL(string: "http://localhost:\(port)/v1/chat/completions")!
-                    var req = URLRequest(url: url)
-                    req.httpMethod = "POST"
-                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    req.httpBody = try JSONSerialization.data(withJSONObject: [
-                        "model": "local",
-                        "messages": messages,
-                        "stream": true,
-                        "temperature": 0.7,
-                        "max_tokens": 4096,
-                    ])
-
-                    let (bytes, _) = try await URLSession.shared.bytes(for: req)
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data: ") else { continue }
-                        let payload = String(line.dropFirst(6))
-                        if payload == "[DONE]" { break }
-                        guard
-                            let data = payload.data(using: .utf8),
-                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                            let choices = json["choices"] as? [[String: Any]],
-                            let delta = choices.first?["delta"] as? [String: Any],
-                            let piece = delta["content"] as? String
-                        else { continue }
-                        accumulated += piece
-                        continuation.yield(accumulated)
+                    for try await event in client.stream(messages: messages, tools: tools) {
+                        switch event {
+                        case .textDelta(let s):   continuation.yield(.textDelta(s))
+                        case .toolCalls(let c):   continuation.yield(.toolCalls(c))
+                        }
                     }
-                    self.history.append((role: "assistant", content: accumulated))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -156,8 +131,9 @@ public final class LlamaCppBackend: ModelBackend {
         process.arguments = [
             "--model", url.path,
             "--port", "\(port)",
-            "--ctx-size", "8192",
-            "-ngl", "99",          // full Metal GPU offload
+            "--ctx-size", "16384",   // headroom for tool transcripts
+            "--jinja",               // enable chat-template tool-call support
+            "-ngl", "99",            // full Metal GPU offload
             "--log-disable",
         ]
         process.standardOutput = FileHandle.nullDevice
@@ -179,19 +155,68 @@ public final class LlamaCppBackend: ModelBackend {
         serverProcess?.terminate()
         serverProcess = nil
         serverStatus = .idle
-        history.removeAll()
+    }
+
+    // MARK: - Installation
+
+    /// Whether the llama-server binary is present on this machine.
+    public var isLlamaServerInstalled: Bool { Self.llamaServerBinary() != nil }
+
+    /// Whether Homebrew is available to install it with.
+    public var isHomebrewInstalled: Bool { Self.brewBinary() != nil }
+
+    /// Run `brew install llama.cpp`, streaming progress into `installProgress`.
+    public func installLlamaCpp() async {
+        guard let brew = Self.brewBinary() else {
+            installState = .failed("Homebrew not found. Install it from brew.sh, then try again.")
+            return
+        }
+        installState = .installing
+        installProgress = "Starting Homebrew…"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: brew)
+        process.arguments = ["install", "llama.cpp"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+        } catch {
+            installState = .failed(error.localizedDescription)
+            return
+        }
+
+        // brew is chatty; surface the latest line so the install doesn't look frozen.
+        do {
+            for try await line in pipe.fileHandleForReading.bytes.lines {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { installProgress = trimmed }
+            }
+        } catch { /* EOF / read end — fall through to exit status */ }
+
+        process.waitUntilExit()
+
+        if process.terminationStatus == 0 && Self.llamaServerBinary() != nil {
+            installState = .idle
+            installProgress = ""
+        } else {
+            installState = .failed(installProgress.isEmpty
+                ? "Install failed (exit code \(process.terminationStatus))."
+                : installProgress)
+        }
+    }
+
+    private static func brewBinary() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/brew",   // Apple Silicon
+            "/usr/local/bin/brew",       // Intel
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     // MARK: - Private helpers
-
-    private func buildMessages() -> [[String: String]] {
-        var out = [[String: String]]()
-        if !systemPromptStore.isEmpty {
-            out.append(["role": "system", "content": systemPromptStore])
-        }
-        for m in history { out.append(["role": m.role, "content": m.content]) }
-        return out
-    }
 
     private func isHealthy() async -> Bool {
         guard let url = URL(string: "http://localhost:\(port)/health") else { return false }

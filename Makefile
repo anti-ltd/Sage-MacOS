@@ -63,6 +63,8 @@ app: icon
 
 run: app
 	@pkill -x Sage 2>/dev/null || true
+	@# Register the freshly-built bundle with Launch Services, else `open` can fail -600.
+	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$(abspath $(BUNDLE))" 2>/dev/null || true
 	open $(BUNDLE)
 
 dmg: app
