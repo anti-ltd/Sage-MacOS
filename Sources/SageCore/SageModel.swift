@@ -14,6 +14,9 @@ public final class SageModel {
     let registry = ToolRegistry()
     public let approvalBroker = ApprovalBroker()
     var loopTask: Task<Void, Never>?
+    var hasReadThisTurn = false   // read-before-write gate: set once the model reads source content
+    var projectHasSource = false  // whether the working dir has code/manifest files (gate only applies if so)
+    private var projectTreeText = ""   // cached recursive file listing injected into the system prompt
 
     public var selectedBackend: BackendType = .apple {
         didSet {
@@ -71,6 +74,12 @@ public final class SageModel {
             - Prefer str_replace for small edits over rewriting whole files.
             - Cite web sources you rely on.
             """)
+            if !projectTreeText.isEmpty {
+                parts.append("""
+                Project files (the actual layout — read the relevant ones with read_file before describing or editing the project; do not rely on directory names alone):
+                \(projectTreeText)
+                """)
+            }
         }
         return parts.joined(separator: "\n\n")
     }
@@ -118,8 +127,54 @@ public final class SageModel {
 
     /// Reset the wire transcript to just the (current) system message.
     func seedTranscript() {
+        refreshProjectContext()
         let system = effectiveSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         transcript = system.isEmpty ? [] : [.system(system)]
+    }
+
+    /// Recompute the cached project file tree + whether the project has source files.
+    private func refreshProjectContext() {
+        guard let wd = workingDirectory else {
+            projectTreeText = ""; projectHasSource = false; return
+        }
+        let result = Self.projectTree(wd)
+        projectTreeText = result.text
+        projectHasSource = result.hasSource
+    }
+
+    /// A bounded, recursive listing of the project's files (relative paths), plus whether any
+    /// are code/manifest files. Skips build/VCS dirs. Injected into the system prompt so the
+    /// model sees the real layout up front instead of having to recurse with many list_dir calls.
+    nonisolated static func projectTree(_ root: URL, maxEntries: Int = 250) -> (text: String, hasSource: Bool) {
+        let fm = FileManager.default
+        let sourceExt: Set<String> = ["swift", "ts", "tsx", "js", "jsx", "py", "rs", "go",
+                                      "rb", "java", "kt", "m", "mm", "c", "cpp", "h"]
+        let manifests: Set<String> = ["package.swift", "package.json", "cargo.toml", "go.mod",
+                                      "pyproject.toml", "gemfile", "makefile"]
+        var files: [String] = []
+        var hasSource = false
+        var truncated = false
+
+        if let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]) {
+            for case let url as URL in en {
+                let p = url.path
+                if p.contains("/.git/") || p.contains("/.build/") || p.contains("/build/")
+                    || p.contains("/node_modules/") || p.contains("/.swiftpm/") {
+                    en.skipDescendants(); continue
+                }
+                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                else { continue }
+                if sourceExt.contains(url.pathExtension.lowercased())
+                    || manifests.contains(url.lastPathComponent.lowercased()) {
+                    hasSource = true
+                }
+                files.append(url.path.replacingOccurrences(of: root.path + "/", with: ""))
+                if files.count >= maxEntries { truncated = true; break }
+            }
+        }
+        files.sort()
+        let text = files.joined(separator: "\n") + (truncated ? "\n… (more files not listed)" : "")
+        return (text, hasSource)
     }
 
     private func resetConversation() {

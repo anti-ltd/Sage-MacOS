@@ -49,10 +49,13 @@ public struct ListDirTool: Tool {
     public var spec: ToolSpec {
         ToolSpec(
             name: "list_dir",
-            description: "List the entries of a directory (one per line, directories marked with a trailing /). Defaults to the project root.",
+            description: "List the entries of a directory (one per line, directories marked with a trailing /). Defaults to the project root. Pass recursive=true to list the entire nested tree in one call instead of descending level by level.",
             parameters: [
                 "type": "object",
-                "properties": ["path": ["type": "string", "description": "Directory path, relative to the project. Defaults to '.'."]],
+                "properties": [
+                    "path": ["type": "string", "description": "Directory path, relative to the project. Defaults to '.'."],
+                    "recursive": ["type": "boolean", "description": "List all nested files and directories, not just one level. Defaults to false."],
+                ],
                 "required": [String](),
             ]
         )
@@ -60,12 +63,34 @@ public struct ListDirTool: Tool {
 
     public func run(arguments: [String: Any], context: ToolContext) async throws -> String {
         let path = (arguments["path"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "."
+        let recursive = (arguments["recursive"] as? Bool) ?? false
         let url = try context.resolve(path)
+        let fm = FileManager.default
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
             throw ToolError.notFound("\(path) (directory)")
         }
-        let entries = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey])
+
+        if recursive {
+            var lines: [String] = []
+            if let en = fm.enumerator(at: url, includingPropertiesForKeys: [.isDirectoryKey]) {
+                while let entry = en.nextObject() as? URL {
+                    let p = entry.path
+                    if p.contains("/.git/") || p.contains("/.build/") || p.contains("/build/")
+                        || p.contains("/node_modules/") || p.contains("/.swiftpm/") {
+                        en.skipDescendants(); continue
+                    }
+                    let dir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                    let rel = entry.path.replacingOccurrences(of: url.path + "/", with: "")
+                    lines.append(dir == true ? rel + "/" : rel)
+                    if lines.count >= 500 { break }
+                }
+            }
+            lines.sort()
+            return lines.isEmpty ? "(empty directory)" : clamp(lines.joined(separator: "\n"))
+        }
+
+        let entries = try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey])
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         let lines = entries.map { entry -> String in
             let dir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false

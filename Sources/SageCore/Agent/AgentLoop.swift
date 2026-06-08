@@ -48,9 +48,15 @@ extension SageModel {
         let tools = currentBackend.supportsTools ? registry.specs() : []
         let context = makeToolContext()
 
-        var writtenPaths: [String] = []   // files changed this turn, for the verification pass
+        hasReadThisTurn = false            // read-before-write gate resets each user turn
+        var writtenPaths: [String] = []    // files changed this turn, for the verification pass
         var verificationDone = false
-        var verifyRowID: UUID?
+
+        // If the user asked to create/edit a file, the turn must end with an actual write —
+        // not the model pasting file contents into its reply.
+        let userRequest = transcript.last(where: { $0.role == .user })?.content ?? ""
+        let expectsWrite = Self.looksLikeWriteRequest(userRequest)
+        var writeNudgeDone = false
 
         var iterations = 0
         while iterations < Self.maxIterations {
@@ -115,10 +121,18 @@ extension SageModel {
 
             if calls.isEmpty {
                 // The model thinks it's done. If it changed any files this turn, run one
-                // verification pass: re-read the source and check every claim against it.
+                // INDEPENDENT verification pass (fresh context, fed the real source) and
+                // feed any findings back so the model can correct them.
                 if !verificationDone, !writtenPaths.isEmpty {
                     verificationDone = true
-                    verifyRowID = beginVerification(of: writtenPaths)
+                    if await verifyAndMaybeCorrect(writtenPaths) { continue }
+                } else if expectsWrite, writtenPaths.isEmpty, !writeNudgeDone {
+                    // The user wanted a file written, but the model answered in prose and
+                    // saved nothing. Drop that answer and make it actually use the tool —
+                    // which then trips the read-before-write gate and forces grounding.
+                    writeNudgeDone = true
+                    messages.removeAll { $0.id == bubbleID }
+                    injectWriteNudge()
                     continue
                 }
                 break
@@ -132,31 +146,157 @@ extension SageModel {
             }
         }
 
-        if let id = verifyRowID { updateRow(id) { $0.status = .ok } }
         isStreaming = false
         loopTask = nil
     }
 
-    /// Inject a verification turn: a UI marker plus a transcript instruction telling the
-    /// model to re-read the source and reconcile the file(s) it just wrote against it.
-    /// Returns the marker row's id so the caller can mark it done when the loop ends.
-    private func beginVerification(of paths: [String]) -> UUID {
-        let list = Array(Set(paths)).sorted().joined(separator: ", ")
+    /// Whether a path points at code or a build manifest (vs. a doc like README). Used by the
+    /// read-before-write gate so reading only the README doesn't count as grounding.
+    nonisolated static func isSourceLikePath(_ path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent.lowercased()
+        let ext = (path as NSString).pathExtension.lowercased()
+        let sourceExt: Set<String> = ["swift", "ts", "tsx", "js", "jsx", "py", "rs", "go",
+                                      "rb", "java", "kt", "m", "mm", "c", "cpp", "h"]
+        let manifests: Set<String> = ["package.swift", "package.json", "cargo.toml", "go.mod",
+                                      "pyproject.toml", "gemfile", "makefile"]
+        return sourceExt.contains(ext) || manifests.contains(name)
+    }
+
+    /// Heuristic: did the user ask to create or modify a file (vs. just ask a question)?
+    nonisolated static func looksLikeWriteRequest(_ text: String) -> Bool {
+        let t = text.lowercased()
+        // Read-only / question intent (e.g. "verify the readme it created") suppresses the nudge.
+        let readOnly = ["verify", "check", "review", "show", "read ", "what", "explain",
+                        "describe", "list", "summar", "how ", "why ", "does ", "is "]
+        if readOnly.contains(where: t.contains) { return false }
+
+        let verbs = ["create", "write", "update", "edit", "add ", "generate", "make ",
+                     "fix", "modify", "rewrite", "append", "implement"]
+        let nouns = ["readme", "file", ".md", ".swift", ".txt", ".json", "license",
+                     "document", "changelog", "docs"]
+        return verbs.contains(where: t.contains) && nouns.contains(where: t.contains)
+    }
+
+    /// Reject a prose answer that should have been a file write, and steer the model to the tool.
+    private func injectWriteNudge() {
+        transcript.append(.user("""
+        You saved nothing to disk this turn and printed file contents in your reply instead. The \
+        request was to create or modify a file. Do not paste file contents as an answer. First \
+        read the relevant source (the build manifest and the main files) to ground it, then create \
+        or edit the file with write_file or str_replace. If no file change is actually needed, say \
+        so in one sentence.
+        """))
+    }
+
+    // MARK: - Independent verification
+
+    /// Check the written file(s) against the real source in a *fresh* context (the verifier
+    /// never sees the conversation that produced them, so it can't defend its own story).
+    /// Returns true if it injected corrections and the main loop should continue.
+    private func verifyAndMaybeCorrect(_ paths: [String]) async -> Bool {
+        guard let wd = workingDirectory else { return false }
+        let list = Array(Set(paths)).sorted()
+
         let row = ChatMessage(role: .assistant, toolActivity: ToolActivity(
             name: "verify",
-            detail: "Re-reading the source to check \(list) for unsupported claims",
+            detail: "Independently checking \(list.joined(separator: ", ")) against the source",
             status: .running))
+        let rowID = row.id
         messages.append(row)
 
+        let source = Self.gatherGroundTruth(wd)
+        let docs = list.compactMap { p -> String? in
+            guard let url = try? ToolContext(workingDirectory: wd, requestApproval: { _, _ in false }).resolve(p),
+                  let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            return "=== DOCUMENT: \(p) ===\n\(text)"
+        }.joined(separator: "\n\n")
+
+        let verifierTranscript: [LLMMessage] = [
+            .system("""
+            You are a strict fact-checker. You are given a project's ACTUAL source code, then \
+            one or more documents written about it. Check every factual claim in each document \
+            against the source. List each claim NOT supported by the source — wrong purpose, \
+            invented features, dependencies, version numbers, build/run commands, file names, or \
+            license — quoting the claim and stating what the source actually shows. Reason only \
+            from the text provided; do not use tools. If every claim is supported, reply with \
+            exactly: VERIFIED
+            """),
+            .user("=== SOURCE (ground truth) ===\n\(source)\n\n\(docs)"),
+        ]
+
+        let verdict = await singleCompletion(verifierTranscript)
+        let verified = verdict.trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased().hasPrefix("VERIFIED")
+
+        updateRow(rowID) {
+            $0.status = verified ? .ok : .failed
+            $0.resultPreview = verified ? "All claims supported by the source" : "Found unsupported claims"
+        }
+
+        if verified { return false }
+
+        // Surface what was caught, then ask the model to fix it.
+        messages.append(ChatMessage(role: .assistant,
+            content: "🔎 Verification found unsupported claims:\n\n\(verdict)"))
         transcript.append(.user("""
-        Before finishing, verify your work. Re-read the project's build manifest and the \
-        actual source files, then check every factual claim in the file(s) you just wrote \
-        (\(list)) against what the code really does. If a claim is not supported by the code — \
-        wrong purpose, invented features, dependencies, version numbers, install commands, or \
-        URLs — correct it with str_replace. Do not invent anything. If it is all accurate, \
-        briefly state what you verified.
+        An independent review of the actual source found these unsupported claims in \
+        \(list.joined(separator: ", ")). Correct each one with str_replace, grounded strictly in \
+        the code. Do not invent anything.
+
+        \(verdict)
         """))
-        return row.id
+        return true
+    }
+
+    /// One tool-free completion; returns the full text (used by the verifier).
+    private func singleCompletion(_ messages: [LLMMessage]) async -> String {
+        var text = ""
+        do {
+            for try await event in currentBackend.stream(messages: messages, tools: []) {
+                if case .textDelta(let piece) = event { text += piece }
+            }
+        } catch {
+            return "Verification could not run: \(error.localizedDescription)"
+        }
+        return text
+    }
+
+    /// Read the manifest + a bounded sample of source files straight off disk, so the verifier
+    /// is guaranteed to see the real code rather than whatever the model chose to read.
+    nonisolated static func gatherGroundTruth(_ wd: URL) -> String {
+        let fm = FileManager.default
+        var blocks: [String] = []
+        var budget = 24_000
+
+        func add(_ url: URL, label: String) {
+            guard budget > 0,
+                  let data = try? Data(contentsOf: url),
+                  let s = String(data: data, encoding: .utf8) else { return }
+            let chunk = String(s.prefix(min(budget, 4_000)))
+            budget -= chunk.count
+            blocks.append("// \(label)\n\(chunk)")
+        }
+
+        for manifest in ["Package.swift", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "Gemfile"] {
+            let u = wd.appendingPathComponent(manifest)
+            if fm.fileExists(atPath: u.path) { add(u, label: manifest) }
+        }
+
+        let codeExt: Set<String> = ["swift", "ts", "tsx", "js", "jsx", "py", "rs", "go", "rb", "java", "kt", "m", "mm", "c", "cpp", "h"]
+        if let en = fm.enumerator(at: wd, includingPropertiesForKeys: nil) {
+            var count = 0
+            for case let url as URL in en {
+                let p = url.path
+                if p.contains("/.git/") || p.contains("/.build/") || p.contains("/build/") || p.contains("/node_modules/") {
+                    en.skipDescendants(); continue
+                }
+                guard codeExt.contains(url.pathExtension.lowercased()) else { continue }
+                add(url, label: url.path.replacingOccurrences(of: wd.path + "/", with: ""))
+                count += 1
+                if count >= 12 || budget <= 0 { break }
+            }
+        }
+        return blocks.isEmpty ? "(no source files found)" : blocks.joined(separator: "\n\n")
     }
 
     /// Resolve, approve if needed, run, and record a single tool call.
@@ -176,6 +316,21 @@ extension SageModel {
         let rowID = row.id
         messages.append(row)
 
+        // Read-before-write gate: refuse to edit a project the model hasn't actually read.
+        // It must read real file content (read_file/grep) before write_file/str_replace.
+        let isWrite = call.name == "write_file" || call.name == "str_replace"
+        if isWrite && !hasReadThisTurn && projectHasSource {
+            updateRow(rowID) { $0.status = .failed; $0.resultPreview = "Blocked: read the source first" }
+            transcript.append(.toolResult("""
+            Blocked: you have not read any source files yet this turn, so you cannot write grounded \
+            content. The project's file layout is listed in your instructions — use read_file on the \
+            build manifest (e.g. Package.swift) and the main source files to learn what the project \
+            actually is and does, then write. Reading only a README does not count; read the code. Do \
+            not write from the project's name or directory names.
+            """, callId: call.id))
+            return nil
+        }
+
         // Approval gate for side-effecting tools.
         if tool.requiresApproval {
             let granted = await context.requestApproval(call, detail)
@@ -190,7 +345,16 @@ extension SageModel {
             let result = try await tool.run(arguments: args, context: context)
             updateRow(rowID) { $0.status = .ok; $0.resultPreview = Self.previewLine(result) }
             transcript.append(.toolResult(result, callId: call.id))
-            if call.name == "write_file" || call.name == "str_replace" {
+            // Reading real source content opens the write gate. grep scans file contents, so it
+            // counts; read_file counts only for source/manifest files (not just the README).
+            if call.name == "grep" {
+                hasReadThisTurn = true
+            } else if call.name == "read_file",
+                      let path = args["path"] as? String,
+                      Self.isSourceLikePath(path) {
+                hasReadThisTurn = true
+            }
+            if isWrite {
                 return args["path"] as? String
             }
             return nil

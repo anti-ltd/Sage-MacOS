@@ -100,6 +100,99 @@ struct InlineToolCallTests {
     }
 }
 
+@Suite("Source-path gate")
+struct SourcePathTests {
+
+    @Test
+    func codeAndManifestsCountAsSource() {
+        #expect(SageModel.isSourceLikePath("Sources/Core/MenuBarScanner.swift"))
+        #expect(SageModel.isSourceLikePath("Package.swift"))
+        #expect(SageModel.isSourceLikePath("Makefile"))
+    }
+
+    @Test
+    func docsDoNotCountAsSource() {
+        #expect(!SageModel.isSourceLikePath("README.md"))
+        #expect(!SageModel.isSourceLikePath("LICENSE"))
+        #expect(!SageModel.isSourceLikePath("notes.txt"))
+    }
+}
+
+@Suite("Project tree")
+struct ProjectTreeTests {
+
+    @Test
+    func listsNestedFilesAndDetectsSource() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("tree-\(UUID().uuidString)")
+        try fm.createDirectory(at: root.appendingPathComponent("Sources/Core"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: root.appendingPathComponent(".build"), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try "x".write(to: root.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+        try "x".write(to: root.appendingPathComponent("Sources/Core/App.swift"), atomically: true, encoding: .utf8)
+        try "x".write(to: root.appendingPathComponent(".build/junk.swift"), atomically: true, encoding: .utf8)
+
+        let tree = SageModel.projectTree(root)
+        #expect(tree.hasSource)
+        #expect(tree.text.contains("Sources/Core/App.swift"))   // nested file surfaced
+        #expect(!tree.text.contains("junk.swift"))              // .build excluded
+    }
+
+    @Test
+    func reportsNoSourceForAssetOnlyProject() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("tree-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try "hi".write(to: root.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
+
+        #expect(!SageModel.projectTree(root).hasSource)   // gate will be bypassed for such projects
+    }
+}
+
+@Suite("Write-intent detection")
+struct WriteIntentTests {
+
+    @Test
+    func detectsFileWriteRequests() {
+        #expect(SageModel.looksLikeWriteRequest("can you create a readme.md at the project root"))
+        #expect(SageModel.looksLikeWriteRequest("update the README accordingly"))
+        #expect(SageModel.looksLikeWriteRequest("write a LICENSE file"))
+    }
+
+    @Test
+    func ignoresQuestionsAndNonFileAsks() {
+        #expect(!SageModel.looksLikeWriteRequest("verify the readme it created"))
+        #expect(!SageModel.looksLikeWriteRequest("what does this project do?"))
+        #expect(!SageModel.looksLikeWriteRequest("make the app faster"))
+    }
+}
+
+@Suite("Verifier ground truth")
+struct GroundTruthTests {
+
+    @Test
+    func gathersManifestAndSourceButSkipsBuildDir() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("gt-\(UUID().uuidString)")
+        try fm.createDirectory(at: root.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: root.appendingPathComponent(".build"), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try "// real manifest\nname: \"BarMaster\"".write(
+            to: root.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+        try "enum MenuBarScanner {}".write(
+            to: root.appendingPathComponent("Sources/MenuBarScanner.swift"), atomically: true, encoding: .utf8)
+        try "GARBAGE".write(
+            to: root.appendingPathComponent(".build/cached.swift"), atomically: true, encoding: .utf8)
+
+        let truth = SageModel.gatherGroundTruth(root)
+        #expect(truth.contains("name: \"BarMaster\""))     // manifest included
+        #expect(truth.contains("MenuBarScanner"))           // real source included
+        #expect(!truth.contains("GARBAGE"))                 // .build excluded
+    }
+}
+
 @Suite("Transcript encoding")
 struct MessageEncodingTests {
 

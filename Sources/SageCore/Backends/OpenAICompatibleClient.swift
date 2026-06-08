@@ -40,7 +40,9 @@ public struct OpenAICompatibleClient: Sendable {
     public func stream(
         messages: [LLMMessage],
         tools: [ToolSpec],
-        temperature: Double = 0.7,
+        // Low by default: this is an agentic/tool harness, not creative chat. High temperature
+        // makes small models improvise — wrong tool-call formatting and invented facts.
+        temperature: Double = 0.2,
         maxTokens: Int = 4096
     ) -> AsyncThrowingStream<StreamEvent, Error> {
         let config = self.config
