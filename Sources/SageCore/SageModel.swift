@@ -18,7 +18,9 @@ public final class SageModel {
     public var selectedBackend: BackendType = .apple {
         didSet {
             guard selectedBackend != oldValue else { return }
+            UserDefaults.standard.set(selectedBackend.rawValue, forKey: "sage.selectedBackend")
             resetConversation()
+            autostartLlamaIfNeeded()
         }
     }
 
@@ -61,6 +63,7 @@ public final class SageModel {
             Ground every answer in what the tools actually show — never guess or invent project details:
             - Before describing, documenting, or editing the project, FIRST inspect it: use list_dir to see the layout and read_file/grep to read the relevant files. Do not write about files you have not read.
             - Only after exploring should you write or edit. When creating docs like a README, base every statement on files you actually read this session.
+            - When you decide to create or change a file, you MUST apply it by calling write_file or str_replace. Never paste the new file contents into your reply as a substitute for calling the tool — pasting does not change anything on disk.
             - Prefer str_replace for small edits over rewriting whole files.
             - Cite web sources you rely on.
             """)
@@ -74,6 +77,11 @@ public final class SageModel {
         if let path = UserDefaults.standard.string(forKey: "sage.workingDirectory"),
            FileManager.default.fileExists(atPath: path) {
             workingDirectory = URL(fileURLWithPath: path)
+        }
+        // didSet doesn't fire during init, so restoring here has no side effects.
+        if let raw = UserDefaults.standard.string(forKey: "sage.selectedBackend"),
+           let backend = BackendType(rawValue: raw) {
+            selectedBackend = backend
         }
         registerTools()
         seedTranscript()
@@ -92,6 +100,16 @@ public final class SageModel {
 
     public func start() {
         seedTranscript()
+        autostartLlamaIfNeeded()
+    }
+
+    /// Start llama-server unprompted when it's the active backend, a model is set,
+    /// and the server is idle — so the user doesn't have to tap Load each time.
+    func autostartLlamaIfNeeded() {
+        guard selectedBackend == .llamaCpp, llama.modelURL != nil else { return }
+        if case .idle = llama.serverStatus {
+            Task { try? await llama.startServer() }
+        }
     }
 
     /// Reset the wire transcript to just the (current) system message.
