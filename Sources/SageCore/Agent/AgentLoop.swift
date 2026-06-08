@@ -48,6 +48,10 @@ extension SageModel {
         let tools = currentBackend.supportsTools ? registry.specs() : []
         let context = makeToolContext()
 
+        var writtenPaths: [String] = []   // files changed this turn, for the verification pass
+        var verificationDone = false
+        var verifyRowID: UUID?
+
         var iterations = 0
         while iterations < Self.maxIterations {
             iterations += 1
@@ -90,40 +94,78 @@ extension SageModel {
                 if !inferred.isEmpty { calls = inferred }
             }
 
-            // Never surface raw tool-call JSON in the chat bubble — strip it whether
-            // the call arrived structured or as text. Some models narrate the call as
-            // content *and* make the structured call, leaving the JSON in `text`.
+            // Strip any raw tool-call JSON from the prose (some models narrate the call
+            // as content *and* emit the structured call).
             let visibleText = calls.isEmpty ? text : strippingToolCallJSON(from: text)
-            updateMessage(bubbleID) { $0.content = visibleText }
 
-            // Record the assistant turn in the transcript the model sees next.
+            // Record the assistant turn in the transcript the model sees next (its own memory).
             transcript.append(LLMMessage(
                 role: .assistant,
                 content: visibleText.isEmpty ? nil : visibleText,
                 toolCalls: calls.isEmpty ? nil : calls))
 
-            // Drop a bubble that's empty once tool-call JSON is stripped out.
-            if visibleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !calls.isEmpty {
+            // Only the final turn (no further tool calls) shows prose. Turns that end in
+            // tool calls are intermediate "I'll now read X" narration — drop the bubble
+            // and keep just the tool rows.
+            if calls.isEmpty {
+                updateMessage(bubbleID) { $0.content = visibleText }
+            } else {
                 messages.removeAll { $0.id == bubbleID }
             }
 
-            if calls.isEmpty { break }   // model is done
+            if calls.isEmpty {
+                // The model thinks it's done. If it changed any files this turn, run one
+                // verification pass: re-read the source and check every claim against it.
+                if !verificationDone, !writtenPaths.isEmpty {
+                    verificationDone = true
+                    verifyRowID = beginVerification(of: writtenPaths)
+                    continue
+                }
+                break
+            }
 
             for call in calls {
                 if Task.isCancelled { break }
-                await execute(call, context: context)
+                if let path = await execute(call, context: context) {
+                    writtenPaths.append(path)
+                }
             }
         }
 
+        if let id = verifyRowID { updateRow(id) { $0.status = .ok } }
         isStreaming = false
         loopTask = nil
     }
 
+    /// Inject a verification turn: a UI marker plus a transcript instruction telling the
+    /// model to re-read the source and reconcile the file(s) it just wrote against it.
+    /// Returns the marker row's id so the caller can mark it done when the loop ends.
+    private func beginVerification(of paths: [String]) -> UUID {
+        let list = Array(Set(paths)).sorted().joined(separator: ", ")
+        let row = ChatMessage(role: .assistant, toolActivity: ToolActivity(
+            name: "verify",
+            detail: "Re-reading the source to check \(list) for unsupported claims",
+            status: .running))
+        messages.append(row)
+
+        transcript.append(.user("""
+        Before finishing, verify your work. Re-read the project's build manifest and the \
+        actual source files, then check every factual claim in the file(s) you just wrote \
+        (\(list)) against what the code really does. If a claim is not supported by the code — \
+        wrong purpose, invented features, dependencies, version numbers, install commands, or \
+        URLs — correct it with str_replace. Do not invent anything. If it is all accurate, \
+        briefly state what you verified.
+        """))
+        return row.id
+    }
+
     /// Resolve, approve if needed, run, and record a single tool call.
-    private func execute(_ call: ToolCall, context: ToolContext) async {
+    /// Returns the file path on a successful write/edit (for the verification pass), else nil.
+    @discardableResult
+    private func execute(_ call: ToolCall, context: ToolContext) async -> String? {
         guard let tool = registry.tool(named: call.name) else {
             transcript.append(.toolResult("Unknown tool: \(call.name).", callId: call.id))
-            return
+            return nil
         }
         let args = call.argumentValues()
         let detail = tool.approvalPreview(arguments: args)
@@ -140,7 +182,7 @@ extension SageModel {
             if !granted {
                 updateRow(rowID) { $0.status = .denied; $0.resultPreview = "Denied" }
                 transcript.append(.toolResult("User denied this action.", callId: call.id))
-                return
+                return nil
             }
         }
 
@@ -148,11 +190,16 @@ extension SageModel {
             let result = try await tool.run(arguments: args, context: context)
             updateRow(rowID) { $0.status = .ok; $0.resultPreview = Self.previewLine(result) }
             transcript.append(.toolResult(result, callId: call.id))
+            if call.name == "write_file" || call.name == "str_replace" {
+                return args["path"] as? String
+            }
+            return nil
         } catch {
             let message = error.localizedDescription
             updateRow(rowID) { $0.status = .failed; $0.resultPreview = message }
             // Feed the error back so the model can recover rather than crash the loop.
             transcript.append(.toolResult("Error: \(message)", callId: call.id))
+            return nil
         }
     }
 
