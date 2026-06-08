@@ -14,12 +14,21 @@ public final class SageModel {
             guard selectedBackend != oldValue else { return }
             messages.removeAll()
             errorMessage = nil
-            currentBackend.reset(systemPrompt: systemPrompt)
+            currentBackend.reset(systemPrompt: effectiveSystemPrompt)
         }
     }
 
     public var systemPrompt: String {
-        didSet { UserDefaults.standard.set(systemPrompt, forKey: "sage.systemPrompt") }
+        didSet {
+            UserDefaults.standard.set(systemPrompt, forKey: "sage.systemPrompt")
+        }
+    }
+
+    public var workingDirectory: URL? {
+        didSet {
+            UserDefaults.standard.set(workingDirectory?.path, forKey: "sage.workingDirectory")
+            applySystemPrompt()
+        }
     }
 
     public let apple = AppleBackend()
@@ -36,14 +45,27 @@ public final class SageModel {
     public var unavailabilityReason: String? { currentBackend.unavailabilityReason }
     public var isMuted: Bool { false }
 
+    // The prompt actually sent to backends — user prompt + cwd context appended.
+    public var effectiveSystemPrompt: String {
+        var parts = [systemPrompt]
+        if let cwd = workingDirectory {
+            parts.append("Working directory: \(cwd.path)")
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
     public init() {
         systemPrompt = UserDefaults.standard.string(forKey: "sage.systemPrompt")
             ?? "You are Sage, a helpful assistant. Be concise and accurate."
+        if let path = UserDefaults.standard.string(forKey: "sage.workingDirectory"),
+           FileManager.default.fileExists(atPath: path) {
+            workingDirectory = URL(fileURLWithPath: path)
+        }
     }
 
     public func start() {
-        apple.reset(systemPrompt: systemPrompt)
-        llama.reset(systemPrompt: systemPrompt)
+        apple.reset(systemPrompt: effectiveSystemPrompt)
+        llama.reset(systemPrompt: effectiveSystemPrompt)
     }
 
     public func send() async {
@@ -81,11 +103,11 @@ public final class SageModel {
     public func newConversation() {
         messages.removeAll()
         errorMessage = nil
-        currentBackend.reset(systemPrompt: systemPrompt)
+        currentBackend.reset(systemPrompt: effectiveSystemPrompt)
     }
 
     public func applySystemPrompt() {
-        apple.reset(systemPrompt: systemPrompt)
-        llama.reset(systemPrompt: systemPrompt)
+        apple.reset(systemPrompt: effectiveSystemPrompt)
+        llama.reset(systemPrompt: effectiveSystemPrompt)
     }
 }

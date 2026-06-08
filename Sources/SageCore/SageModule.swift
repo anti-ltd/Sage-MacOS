@@ -22,7 +22,7 @@ public final class SageModule: AppModule {
     public var isMuted: Bool { false }
 
     public func settingsView() -> AnyView {
-        AnyView(PopoverView(model: model))
+        AnyView(SageSettingsContent(model: model))
     }
 
     public func windowView() -> AnyView {

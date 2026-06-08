@@ -62,6 +62,7 @@ app: icon
 	@echo "Built $(BUNDLE) (signed: $(SIGN_ID))"
 
 run: app
+	@pkill -x Sage 2>/dev/null || true
 	open $(BUNDLE)
 
 dmg: app

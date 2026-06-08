@@ -13,52 +13,56 @@ public struct ChatView: View {
         self.compact = compact
     }
 
+    @State private var showModelPicker = false
+    @State private var showSettings = false
+
     public var body: some View {
         VStack(spacing: 0) {
-            modelBar
-            Divider()
             if !model.isAvailable {
                 unavailableView
             } else {
                 messagesView
+                    .layoutPriority(1)
                 Divider()
                 inputBar
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Model picker bar
-
-    private var modelBar: some View {
-        HStack(spacing: 8) {
-            Picker("", selection: $model.selectedBackend) {
-                ForEach(BackendType.allCases) { t in
-                    Label(t.shortLabel, systemImage: t.icon).tag(t)
+        .toolbar {
+            if let cwd = model.workingDirectory {
+                ToolbarItem(placement: .navigation) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder.fill")
+                            .imageScale(.small)
+                            .foregroundStyle(.secondary)
+                        Text(cwd.lastPathComponent)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .help(cwd.path)
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 220)
-            .labelsHidden()
+            ToolbarItem(placement: .primaryAction) {
+                HStack(spacing: 4) {
+                    Button {
+                        showSettings.toggle()
+                    } label: {
+                        Image(systemName: "gear")
+                    }
+                    .help("Settings")
+                    .popover(isPresented: $showSettings, arrowEdge: .top) {
+                        SageSettingsContent(model: model)
+                            .frame(width: 360, height: 480)
+                    }
 
-            if model.selectedBackend == .llamaCpp {
-                llamaStatusPill
+                    Button { model.newConversation() } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    .help("New Conversation")
+                    .opacity(model.messages.isEmpty ? 0.35 : 1)
+                }
             }
-
-            Spacer()
-
-            Button {
-                model.newConversation()
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .imageScale(.medium)
-            }
-            .buttonStyle(.plain)
-            .help("New conversation")
-            .opacity(model.messages.isEmpty ? 0.35 : 1)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
     }
 
     private var llamaStatusPill: some View {
@@ -154,6 +158,8 @@ public struct ChatView: View {
 
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 8) {
+            modelPickerButton
+
             TextField("Message", text: $model.inputText, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(compact ? 4 : 8)
@@ -184,6 +190,60 @@ public struct ChatView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var modelPickerButton: some View {
+        Button {
+            showModelPicker.toggle()
+        } label: {
+            Image(systemName: model.selectedBackend.icon)
+                .font(.system(size: 16))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+        }
+        .buttonStyle(.plain)
+        .help("Choose model")
+        .popover(isPresented: $showModelPicker, arrowEdge: .bottom) {
+            modelPickerPopover
+        }
+    }
+
+    private var modelPickerPopover: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(BackendType.allCases, id: \.self) { (backend: BackendType) in
+                Button {
+                    model.selectedBackend = backend
+                    showModelPicker = false
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: backend.icon)
+                            .frame(width: 18)
+                        Text(backend.shortLabel)
+                            .font(.body)
+                        Spacer()
+                        if model.selectedBackend == backend {
+                            Image(systemName: "checkmark")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if backend == .apple && BackendType.allCases.last != backend {
+                    Divider()
+                }
+            }
+
+            if model.selectedBackend == .llamaCpp {
+                Divider()
+                llamaStatusPill
+                    .font(.caption)
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 180)
     }
 
     private func sendIfReady() {
@@ -230,13 +290,27 @@ struct MessageBubble: View {
     }
 }
 
+// MARK: - Full window
+
+public struct ChatWindowView: View {
+    @Bindable var model: SageModel
+
+    public init(model: SageModel) { self.model = model }
+
+    public var body: some View {
+        ChatView(model: model)
+    }
+}
+
 // MARK: - Settings tab
 
-struct SageSettingsContent: View {
+public struct SageSettingsContent: View {
     @Bindable var model: SageModel
     @State private var draft: String = ""
 
-    var body: some View {
+    public init(model: SageModel) { self.model = model }
+
+    public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 iUX_MacOS.CardSection("System Prompt") {
@@ -257,6 +331,10 @@ struct SageSettingsContent: View {
                         }
                         .controlSize(.small)
                     }
+                }
+
+                iUX_MacOS.CardSection("Project") {
+                    WorkingDirectoryPicker(url: $model.workingDirectory)
                 }
 
                 iUX_MacOS.CardSection("llama.cpp") {
@@ -352,6 +430,79 @@ struct LlamaCppSettingsContent: View {
         case .ready:     return "Ready"
         case .error:     return "Error — see below"
         }
+    }
+}
+
+// MARK: - Working directory picker
+
+struct WorkingDirectoryPicker: View {
+    @Binding var url: URL?
+    @State private var isTargeted = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+
+                if let url {
+                    Text(url.lastPathComponent)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(url.deletingLastPathComponent().path)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Text("No project set")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
+
+                Spacer()
+
+                Button("Choose…") { chooseDirectory() }
+                    .controlSize(.small)
+
+                if url != nil {
+                    Button("Clear", role: .destructive) { url = nil }
+                        .controlSize(.small)
+                }
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isTargeted
+                          ? Color.accentColor.opacity(0.12)
+                          : Color(nsColor: .controlBackgroundColor))
+                    .stroke(isTargeted ? Color.accentColor : Color(nsColor: .separatorColor),
+                            lineWidth: isTargeted ? 1.5 : 0.5)
+            )
+            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                guard let provider = providers.first else { return false }
+                _ = provider.loadObject(ofClass: URL.self) { dropped, _ in
+                    guard let dropped, dropped.hasDirectoryPath else { return }
+                    DispatchQueue.main.async { url = dropped }
+                }
+                return true
+            }
+
+            Text("Drag a folder here or choose one. The path is added to every conversation so the model knows your project context.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose project directory"
+        guard panel.runModal() == .OK, let picked = panel.url else { return }
+        url = picked
     }
 }
 
